@@ -32,9 +32,20 @@ This guide walks you through using the **Ralph Method** with **Claude Code** to 
 
 ### What We're Building
 
-- **kgateway**: Kubernetes-native API gateway built on Envoy and Gateway API
-- **agentgateway**: AI/ML traffic routing, MCP tool federation, and agent connectivity
+- **kgateway**: Kubernetes-native API gateway built on Envoy and Gateway API (CNCF sandbox project, formerly Gloo)
+- **agentgateway**: AI/ML traffic routing, MCP tool federation, A2A agent connectivity, and LLM consumption gateway
 - **Kind cluster**: Local Kubernetes for rapid iteration
+
+### Two Installation Paths
+
+There are two ways to deploy agentgateway:
+
+| Option | Namespace | Use Case |
+|--------|-----------|----------|
+| **kgateway + agentgateway** | `kgateway-system` | When you need both Envoy-based routing AND AI gateway |
+| **Standalone agentgateway** | `agentgateway-system` | Pure AI gateway use cases (recommended for this POC) |
+
+This guide covers **both** options.
 
 ### Why Ralph Works for This
 
@@ -65,29 +76,40 @@ command -v jq && echo "✓ jq"
 ### Install Missing Tools
 
 ```bash
-# Kind
-curl -Lo ./kind https://kind.sigs.k8s.io/dl/v0.24.0/kind-$(uname)-amd64
+# Kind (check https://kind.sigs.k8s.io for latest version)
+curl -Lo ./kind https://kind.sigs.k8s.io/dl/v0.25.0/kind-$(uname | tr '[:upper:]' '[:lower:]')-amd64
 chmod +x ./kind && sudo mv ./kind /usr/local/bin/kind
 
-# Claude Code (requires Node.js 18+)
-npm install -g @anthropic-ai/claude-code
+# Claude Code (RECOMMENDED: Native installation)
+curl -fsSL https://claude.ai/install.sh | bash
+# Reload shell
+source ~/.bashrc  # or source ~/.zshrc for zsh
+
+# Verify Claude Code
+claude --version
+claude doctor
+
+# Alternative: npm installation (deprecated but works)
+# npm install -g @anthropic-ai/claude-code
 
 # Helm
 curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
 
 # jq
-sudo apt-get install jq  # or brew install jq
+sudo apt-get install jq  # or brew install jq on macOS
 ```
 
 ### API Keys
 
 ```bash
-# Set your Anthropic API key for Claude Code
+# For Claude Code authentication (if using API directly)
 export ANTHROPIC_API_KEY="sk-ant-..."
 
-# Optional: OpenAI key for testing agentgateway routing
+# Optional: For testing LLM routing through agentgateway
 export OPENAI_API_KEY="sk-..."
 ```
+
+> **Note**: Claude Code can also authenticate via OAuth with your Claude.ai account (Pro/Max plan) or Anthropic Console.
 
 ---
 
@@ -125,20 +147,101 @@ kgateway-poc/
 mkdir -p kgateway-poc && cd kgateway-poc
 ```
 
-### 2. Create the PROMPT.md
+### 2. Create Kind Cluster
+
+```bash
+# Create cluster config
+cat > kind-config.yaml << 'EOF'
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: agentgateway-poc
+nodes:
+  - role: control-plane
+    extraPortMappings:
+      # Map NodePort range to host
+      - containerPort: 30080
+        hostPort: 30080
+        protocol: TCP
+      - containerPort: 30443
+        hostPort: 30443
+        protocol: TCP
+    kubeadmConfigPatches:
+      - |
+        kind: InitConfiguration
+        nodeRegistration:
+          kubeletExtraArgs:
+            node-labels: "ingress-ready=true"
+EOF
+
+# Create the cluster
+kind create cluster --config kind-config.yaml
+```
+
+### 3. Install Gateway API CRDs
+
+```bash
+# Install Gateway API v1.4.0 (current as of Jan 2025)
+kubectl apply -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.4.0/standard-install.yaml
+```
+
+### 4. Install agentgateway (Choose One Option)
+
+**Option A: Standalone agentgateway (Recommended for AI-focused POC)**
+
+```bash
+# Install agentgateway CRDs
+helm upgrade -i --create-namespace \
+  --namespace agentgateway-system \
+  --version v2.2.0-main \
+  agentgateway-crds oci://ghcr.io/kgateway-dev/charts/agentgateway-crds
+
+# Install agentgateway control plane
+helm upgrade -i -n agentgateway-system \
+  agentgateway oci://ghcr.io/kgateway-dev/charts/agentgateway \
+  --version v2.2.0-main \
+  --set controller.image.pullPolicy=Always
+
+# Verify installation
+kubectl get pods -n agentgateway-system
+kubectl get gatewayclass agentgateway
+```
+
+**Option B: kgateway with agentgateway enabled**
+
+```bash
+# Install kgateway CRDs
+helm upgrade -i --create-namespace \
+  --namespace kgateway-system \
+  --version v2.1.2 \
+  kgateway-crds oci://cr.kgateway.dev/kgateway-dev/charts/kgateway-crds
+
+# Install kgateway with agentgateway enabled
+helm upgrade -i -n kgateway-system \
+  kgateway oci://cr.kgateway.dev/kgateway-dev/charts/kgateway \
+  --version v2.1.2 \
+  --set agentgateway.enabled=true
+
+# Verify installation
+kubectl get pods -n kgateway-system
+kubectl get gatewayclass kgateway
+kubectl get gatewayclass agentgateway
+```
+
+### 5. Create the PROMPT.md
 
 ```bash
 cat > PROMPT.md << 'EOF'
 # kgateway + agentgateway POC
 
-You are building a Proof of Concept for kgateway with agentgateway on a Kind cluster.
+You are building a Proof of Concept for agentgateway on a Kind cluster.
 
 ## Current State
-- [ ] Kind cluster created
-- [ ] kgateway installed via Helm
-- [ ] agentgateway enabled
+- [x] Kind cluster created
+- [x] Gateway API CRDs installed (v1.4.0)
+- [x] agentgateway installed via Helm
+- [ ] Gateway resource created
 - [ ] Basic HTTPRoute working
-- [ ] MCP endpoint accessible
+- [ ] LLM routing endpoint accessible
 
 ## Your Task
 Check the current state, then work on the next uncompleted item.
@@ -154,10 +257,12 @@ Update this checklist as you complete tasks.
 - kgateway docs: https://kgateway.dev/docs/
 - agentgateway docs: https://kgateway.dev/docs/agentgateway/main/
 - Use NodePort (not LoadBalancer) for Kind compatibility
+- GatewayClass name: agentgateway
+- Namespace: agentgateway-system
 EOF
 ```
 
-### 3. Start Ralph
+### 6. Start Ralph
 
 ```bash
 while :; do cat PROMPT.md | claude ; done
@@ -172,25 +277,24 @@ Here's a comprehensive template tailored for kgateway/agentgateway work:
 ```markdown
 # kgateway + agentgateway POC
 
-You are Ralph, an AI engineer building a kgateway + agentgateway POC on Kind.
+You are Ralph, an AI engineer building an agentgateway POC on Kind.
 
 ## 🎯 Mission
 Build a working agentgateway deployment that can:
-1. Route AI/LLM traffic to multiple backends
+1. Route AI/LLM traffic to cloud providers (OpenAI, Anthropic)
 2. Expose MCP tool federation endpoint
 3. Support basic observability
 
 ## 📍 Current State
 <!-- Update this as you progress -->
 - [x] Kind cluster running
-- [ ] Gateway API CRDs installed
-- [ ] kgateway Helm chart deployed
-- [ ] agentgateway enabled
-- [ ] Gateway resource created
+- [x] Gateway API CRDs installed (v1.4.0)
+- [x] agentgateway Helm chart deployed (v2.2.0-main)
+- [ ] Gateway resource created (gatewayClassName: agentgateway)
+- [ ] Service converted to NodePort for Kind access
 - [ ] HTTPRoute for /openai working
 - [ ] HTTPRoute for /anthropic working
 - [ ] MCP endpoint accessible
-- [ ] Token-based rate limiting configured
 - [ ] End-to-end test passing
 
 ## 🔨 Your Task
@@ -199,7 +303,7 @@ Work on the FIRST unchecked item. Complete it fully before moving on.
 ## 📁 Project Structure
 - `kind/cluster-config.yaml` - Kind cluster configuration
 - `manifests/` - Kubernetes manifests
-- `helm/values.yaml` - Helm values for kgateway
+- `helm/values.yaml` - Helm values for agentgateway
 - `scripts/` - Setup, test, and teardown scripts
 - `tests/` - Test scripts and curl commands
 - `CHANGELOG.md` - What you've built
@@ -213,13 +317,22 @@ Work on the FIRST unchecked item. Complete it fully before moving on.
 - NEVER mark a task complete without verification
 
 ### Kind-Specific Rules
-- Use `type: NodePort` for services (LoadBalancer won't work)
-- Get node IP: `kubectl get nodes -o wide`
-- Access pattern: `<node-ip>:<nodeport>`
+- Use `type: NodePort` for services (LoadBalancer stays PENDING in Kind)
+- Get node IP: `kubectl get nodes -o wide` (use InternalIP)
+- For localhost access in Kind: `docker exec -it agentgateway-poc-control-plane ip addr`
+- Access pattern: `localhost:<hostPort>` if using extraPortMappings, otherwise `<node-ip>:<nodeport>`
 
 ### Helm Rules
-- Check existing values: `helm get values kgateway -n kgateway-system`
-- Upgrade command: `helm upgrade kgateway kgateway/kgateway -n kgateway-system -f helm/values.yaml`
+- Check existing values: `helm get values agentgateway -n agentgateway-system`
+- Helm chart location: `oci://ghcr.io/kgateway-dev/charts/agentgateway`
+- CRDs chart: `oci://ghcr.io/kgateway-dev/charts/agentgateway-crds`
+- Current version: v2.2.0-main (dev) or v2.1.2 (stable)
+
+### Gateway API Rules
+- GatewayClass for agentgateway: `agentgateway`
+- GatewayClass for kgateway (Envoy): `kgateway`
+- Gateway and HTTPRoute are namespaced resources
+- parentRefs in HTTPRoute must match Gateway name AND namespace
 
 ### File Management
 - Create missing directories before writing files
@@ -239,25 +352,29 @@ Work on the FIRST unchecked item. Complete it fully before moving on.
 kubectl cluster-info
 kubectl get nodes -o wide
 
-# Check kgateway
-kubectl get pods -n kgateway-system
+# Check agentgateway
+kubectl get pods -n agentgateway-system
 kubectl get gateway -A
 kubectl get httproute -A
+kubectl get gatewayclass
 
-# Check agentgateway
-kubectl get svc agentgateway -n kgateway-system
-kubectl logs -n kgateway-system -l app=agentgateway
+# Get service details
+kubectl get svc -n agentgateway-system
 
-# Test endpoint
-NODE_IP=$(kubectl get nodes -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}')
-NODE_PORT=$(kubectl get svc agentgateway -n kgateway-system -o jsonpath='{.spec.ports[0].nodePort}')
-curl -v http://${NODE_IP}:${NODE_PORT}/healthz
+# Convert to NodePort (if needed)
+kubectl patch svc <gateway-name> -n agentgateway-system -p '{"spec": {"type": "NodePort"}}'
+
+# Check logs
+kubectl logs -n agentgateway-system -l app.kubernetes.io/name=agentgateway
+
+# Test endpoint (adjust port as needed)
+curl -v http://localhost:30080/healthz
 ```
 
 ### Key Resources
 - Gateway API: `gateway.networking.k8s.io/v1`
-- kgateway docs: https://kgateway.dev/docs/
-- agentgateway: https://kgateway.dev/docs/agentgateway/main/
+- agentgateway docs: https://kgateway.dev/docs/agentgateway/main/
+- GatewayClass: agentgateway
 
 ## 📝 Output Format
 After each action, report:
@@ -336,21 +453,25 @@ When Ralph makes mistakes, you "tune" Ralph by adding guidance to the prompt. Th
 
 ## Lessons Learned
 
-### 2024-01-15: LoadBalancer doesn't work in Kind
+### 2025-01-15: LoadBalancer doesn't work in Kind
 **Problem**: Ralph kept creating LoadBalancer services that stayed in `<pending>`
 **Sign Added**: "Use `type: NodePort` for services (LoadBalancer won't work in Kind)"
 
-### 2024-01-15: Forgot to install Gateway API CRDs
+### 2025-01-15: Wrong GatewayClass name
+**Problem**: Used `kgateway` instead of `agentgateway`
+**Sign Added**: "GatewayClass for agentgateway is 'agentgateway', not 'kgateway'"
+
+### 2025-01-15: Forgot Gateway API CRDs
 **Problem**: Gateway resources failed with "no matches for kind Gateway"
-**Sign Added**: Added CRD installation as explicit first step in checklist
+**Sign Added**: Added CRD installation as explicit first step
 
-### 2024-01-16: Wrong agentgateway port
-**Problem**: Kept curling port 8080 when it was on 8081
-**Sign Added**: "Always check actual port: `kubectl get svc -n kgateway-system`"
+### 2025-01-16: Wrong Helm chart URL
+**Problem**: Used old cr.kgateway.dev instead of ghcr.io
+**Sign Added**: "agentgateway charts are at oci://ghcr.io/kgateway-dev/charts/agentgateway"
 
-### 2024-01-16: Helm upgrade without namespace
+### 2025-01-16: Helm upgrade without namespace
 **Problem**: Created duplicate release in default namespace
-**Sign Added**: "ALWAYS include `-n kgateway-system` in helm commands"
+**Sign Added**: "ALWAYS include `-n agentgateway-system` in helm commands"
 ```
 
 ### Common Signs to Add
@@ -363,98 +484,164 @@ Add these to your PROMPT.md as needed:
 ### Networking
 - LoadBalancer = PENDING in Kind. Use NodePort.
 - Get node IP: `kubectl get nodes -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}'`
-- MetalLB can provide LoadBalancer IPs in Kind if needed
+- MetalLB can provide LoadBalancer IPs in Kind if needed (but adds complexity)
 
-### Helm
-- ALWAYS check existing values before upgrade: `helm get values kgateway -n kgateway-system`
-- ALWAYS use `-n kgateway-system` flag
-- Use `--reuse-values` to preserve existing config
+### Helm Charts (IMPORTANT - URLs changed!)
+- agentgateway charts: `oci://ghcr.io/kgateway-dev/charts/agentgateway`
+- agentgateway-crds: `oci://ghcr.io/kgateway-dev/charts/agentgateway-crds`
+- kgateway charts: `oci://cr.kgateway.dev/kgateway-dev/charts/kgateway`
+- ALWAYS check existing values before upgrade: `helm get values <release> -n <namespace>`
+- ALWAYS use the correct namespace flag
 
 ### Gateway API
-- Install CRDs FIRST: `kubectl apply -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.2.0/standard-install.yaml`
-- Gateway must reference correct GatewayClass: `kgateway`
+- Install CRDs FIRST: `kubectl apply -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.4.0/standard-install.yaml`
+- GatewayClass for agentgateway: `agentgateway`
+- GatewayClass for kgateway (Envoy): `kgateway`
 - HTTPRoute parentRefs must match Gateway name AND namespace
 
-### agentgateway
-- Enable in Helm values: `agentgateway.enabled: true`
-- Check logs: `kubectl logs -n kgateway-system -l app.kubernetes.io/name=agentgateway`
-- Default port is 8080
+### agentgateway Specifics
+- Namespace: agentgateway-system (standalone) or kgateway-system (integrated)
+- Enable in kgateway Helm: `agentgateway.enabled: true` (lowercase!)
+- Note: `agentGateway` (camelCase) was the OLD spelling before v2.1
 
 ### Debugging
-- Pod not starting? Check events: `kubectl describe pod <name> -n kgateway-system`
-- Service not accessible? Check endpoints: `kubectl get endpoints -n kgateway-system`
-- Route not working? Check Gateway status: `kubectl get gateway -n kgateway-system -o yaml`
+- Pod not starting? Check events: `kubectl describe pod <n> -n agentgateway-system`
+- Service not accessible? Check endpoints: `kubectl get endpoints -n agentgateway-system`
+- Route not working? Check Gateway status: `kubectl get gateway -A -o yaml`
+- Check controller logs: `kubectl logs -n agentgateway-system -l app.kubernetes.io/name=agentgateway`
 ```
 
 ---
 
 ## Example Workflows
 
-### Workflow 1: Initial Setup
+### Workflow 1: Initial Setup with Standalone agentgateway
 
 ```markdown
 ## 🔨 Your Task
-Set up the Kind cluster and install kgateway.
+Set up the Kind cluster and install standalone agentgateway.
 
 ## Steps
 1. Create Kind cluster with port mappings
-2. Install Gateway API CRDs
-3. Add kgateway Helm repo
-4. Install kgateway with agentgateway enabled
+2. Install Gateway API CRDs (v1.4.0)
+3. Install agentgateway-crds Helm chart
+4. Install agentgateway Helm chart
 5. Verify pods are running
+6. Verify GatewayClass exists
+
+## Commands
+```bash
+# Gateway API CRDs
+kubectl apply -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.4.0/standard-install.yaml
+
+# agentgateway CRDs
+helm upgrade -i --create-namespace \
+  --namespace agentgateway-system \
+  --version v2.2.0-main \
+  agentgateway-crds oci://ghcr.io/kgateway-dev/charts/agentgateway-crds
+
+# agentgateway
+helm upgrade -i -n agentgateway-system \
+  agentgateway oci://ghcr.io/kgateway-dev/charts/agentgateway \
+  --version v2.2.0-main
+```
 
 ## Verification
 - [ ] `kubectl get nodes` shows Ready
-- [ ] `kubectl get pods -n kgateway-system` shows Running
-- [ ] `kubectl get gateway -n kgateway-system` shows Accepted
+- [ ] `kubectl get pods -n agentgateway-system` shows Running
+- [ ] `kubectl get gatewayclass agentgateway` shows Accepted=True
 ```
 
-### Workflow 2: Configure AI Routing
+### Workflow 2: Create Gateway and Test Route
 
 ```markdown
 ## 🔨 Your Task
-Configure HTTPRoutes for AI backend routing.
+Create a Gateway resource and test basic routing.
 
-## Requirements
-- Route /v1/chat/completions to OpenAI
-- Route /v1/messages to Anthropic
-- Apply token-based rate limiting
+## Gateway Manifest
+```yaml
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: ai-gateway
+  namespace: agentgateway-system
+spec:
+  gatewayClassName: agentgateway  # MUST be 'agentgateway'
+  listeners:
+    - name: http
+      protocol: HTTP
+      port: 8080
+      allowedRoutes:
+        namespaces:
+          from: All
+```
 
 ## Steps
-1. Create ExternalName services for backends
+1. Apply Gateway manifest
+2. Wait for Gateway to be Programmed
+3. Check the created service
+4. Patch to NodePort if needed
+5. Test with curl
+
+## Commands
+```bash
+# Apply and wait
+kubectl apply -f gateway.yaml
+kubectl wait --for=condition=Programmed=True -n agentgateway-system gateway/ai-gateway --timeout=60s
+
+# Check service
+kubectl get svc -n agentgateway-system
+
+# Patch to NodePort
+kubectl patch svc ai-gateway -n agentgateway-system -p '{"spec": {"type": "NodePort"}}'
+
+# Get NodePort
+kubectl get svc ai-gateway -n agentgateway-system -o jsonpath='{.spec.ports[0].nodePort}'
+```
+```
+
+### Workflow 3: Configure LLM Routing
+
+```markdown
+## 🔨 Your Task
+Configure HTTPRoutes for LLM provider routing.
+
+## Requirements
+- Route /v1/chat/completions to OpenAI backend
+- Route /v1/messages to Anthropic backend
+
+## Steps
+1. Create Backend resources (or ExternalName services)
 2. Create HTTPRoutes with path matching
 3. Test with curl
 
+## Example HTTPRoute for OpenAI
+```yaml
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: openai-route
+  namespace: agentgateway-system
+spec:
+  parentRefs:
+    - name: ai-gateway
+      namespace: agentgateway-system
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /v1/chat/completions
+      backendRefs:
+        - name: openai-backend
+          port: 443
+```
+
 ## Verification
 ```bash
-curl -X POST http://${GATEWAY_URL}/v1/chat/completions \
+curl -X POST http://localhost:<nodeport>/v1/chat/completions \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer ${OPENAI_API_KEY}" \
   -d '{"model": "gpt-4", "messages": [{"role": "user", "content": "Hello"}]}'
-```
-```
-
-### Workflow 3: MCP Tool Federation
-
-```markdown
-## 🔨 Your Task
-Set up MCP tool federation endpoint.
-
-## Requirements
-- Expose MCP SSE endpoint
-- Configure tool routing
-- Test with MCP client
-
-## Steps
-1. Enable MCP in agentgateway config
-2. Create MCP-specific HTTPRoute
-3. Configure backend MCP servers
-4. Test SSE connection
-
-## Verification
-```bash
-curl -N http://${GATEWAY_URL}/mcp/sse \
-  -H "Accept: text/event-stream"
 ```
 ```
 
@@ -490,55 +677,61 @@ Before creating any YAML file:
 4. Only proceed when dry-run passes
 ```
 
-### Ralph Forgets Previous Context
+### GatewayClass Not Found
 
-**Symptom**: Recreates files that already exist
+**Symptom**: `no matches for kind "GatewayClass"`
 
-**Fix**: Add state checking:
-```markdown
-## Before Starting
-1. Check what exists: `ls -la manifests/`
-2. Check cluster state: `kubectl get all -n kgateway-system`
-3. Read CHANGELOG.md for history
-4. Only work on what's NOT done
+**Fix**: Gateway API CRDs not installed
+```bash
+kubectl apply -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.4.0/standard-install.yaml
 ```
 
-### Ralph Uses Wrong Commands
+### Gateway Stuck in "Pending"
 
-**Symptom**: Commands fail because of wrong syntax
+**Symptom**: Gateway never becomes Programmed
 
-**Fix**: Add command reference:
-```markdown
-## Command Cheatsheet (USE THESE EXACT COMMANDS)
-- Install CRDs: `kubectl apply -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.2.0/standard-install.yaml`
-- Helm install: `helm install kgateway kgateway/kgateway -n kgateway-system --create-namespace`
-- Helm upgrade: `helm upgrade kgateway kgateway/kgateway -n kgateway-system -f helm/values.yaml`
+**Fix**: Check controller logs and events
+```bash
+kubectl describe gateway <n> -n agentgateway-system
+kubectl logs -n agentgateway-system -l app.kubernetes.io/name=agentgateway
+```
+
+### Service External IP is "pending"
+
+**Symptom**: LoadBalancer service never gets an IP
+
+**Fix**: Kind doesn't support LoadBalancer. Use NodePort:
+```bash
+kubectl patch svc <n> -n agentgateway-system -p '{"spec": {"type": "NodePort"}}'
 ```
 
 ---
 
 ## References
 
-### kgateway Documentation
+### kgateway/agentgateway Documentation
 - Main docs: https://kgateway.dev/docs/
-- agentgateway: https://kgateway.dev/docs/agentgateway/main/
-- Helm chart: https://github.com/k8sgateway/k8sgateway
+- agentgateway (main): https://kgateway.dev/docs/agentgateway/main/
+- agentgateway (stable): https://kgateway.dev/docs/agentgateway/latest/
+- Helm values reference: https://kgateway.dev/docs/agentgateway/main/reference/helm/
+- GitHub: https://github.com/kgateway-dev/kgateway
 
 ### Gateway API
 - Spec: https://gateway-api.sigs.k8s.io/
-- CRD install: https://gateway-api.sigs.k8s.io/guides/#installing-gateway-api
+- CRD install (v1.4.0): https://github.com/kubernetes-sigs/gateway-api/releases/tag/v1.4.0
 
 ### Kind
 - Quick start: https://kind.sigs.k8s.io/docs/user/quick-start/
-- Ingress: https://kind.sigs.k8s.io/docs/user/ingress/
+- LoadBalancer workaround: https://kind.sigs.k8s.io/docs/user/loadbalancer/
 
 ### Ralph Method
 - Original post: https://ghuntley.com/ralph/
 - Key insight: "deterministically bad in an undeterministic world"
 
 ### Claude Code
-- Docs: https://docs.anthropic.com/en/docs/claude-code
+- Setup docs: https://code.claude.com/docs/en/setup
 - GitHub: https://github.com/anthropics/claude-code
+- Install: `curl -fsSL https://claude.ai/install.sh | bash`
 
 ---
 
@@ -548,19 +741,21 @@ Before creating any YAML file:
 # kind/cluster-config.yaml
 kind: Cluster
 apiVersion: kind.x-k8s.io/v1alpha4
-name: kgateway-poc
+name: agentgateway-poc
 nodes:
   - role: control-plane
     extraPortMappings:
-      # agentgateway NodePort range
-      - containerPort: 30000
-        hostPort: 30000
+      # HTTP traffic
+      - containerPort: 30080
+        hostPort: 30080
         protocol: TCP
-      - containerPort: 30001
-        hostPort: 30001
+      # HTTPS traffic
+      - containerPort: 30443
+        hostPort: 30443
         protocol: TCP
-      - containerPort: 32000
-        hostPort: 32000
+      # Additional ports for testing
+      - containerPort: 31000
+        hostPort: 31000
         protocol: TCP
     kubeadmConfigPatches:
       - |
@@ -570,23 +765,35 @@ nodes:
             node-labels: "ingress-ready=true"
 ```
 
-## Appendix: Helm Values for agentgateway
+## Appendix: Helm Values for Standalone agentgateway
 
 ```yaml
-# helm/values.yaml
-agentgateway:
-  enabled: true
-  
+# helm/agentgateway-values.yaml
 controller:
   image:
-    tag: latest
-    
-gateway:
-  enabled: true
+    pullPolicy: Always  # For dev builds
+  logLevel: debug       # Verbose logging for POC
   
-# For Kind compatibility
-service:
-  type: NodePort
+# Service configuration for Kind
+# Note: The Gateway resource creates its own service
+# This is for the controller service if needed
+```
+
+## Appendix: Helm Values for kgateway with agentgateway
+
+```yaml
+# helm/kgateway-values.yaml
+agentgateway:
+  enabled: true       # Note: lowercase (changed from agentGateway in v2.1)
+
+controller:
+  image:
+    pullPolicy: IfNotPresent
+
+# For AI Gateway features with Envoy (deprecated in favor of agentgateway)
+# gateway:
+#   aiExtension:
+#     enabled: true
 ```
 
 ---
@@ -597,6 +804,9 @@ service:
 ┌─────────────────────────────────────────────────────────────────┐
 │                    RALPH METHOD QUICK REF                        │
 ├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  INSTALL CLAUDE CODE:                                            │
+│    curl -fsSL https://claude.ai/install.sh | bash                │
 │                                                                  │
 │  START RALPH:                                                    │
 │    while :; do cat PROMPT.md | claude ; done                     │
@@ -610,22 +820,45 @@ service:
 │    3. Restart loop                                               │
 │                                                                  │
 │  KEY FILES:                                                      │
-│    PROMPT.md   - Ralph's brain (edit this to tune)               │
-│    SIGNS.md    - Lessons learned                                 │
+│    PROMPT.md    - Ralph's brain (edit this to tune)              │
+│    SIGNS.md     - Lessons learned                                │
 │    CHANGELOG.md - What Ralph built                               │
 │                                                                  │
+│  HELM CHARTS:                                                    │
+│    agentgateway: oci://ghcr.io/kgateway-dev/charts/agentgateway  │
+│    kgateway:     oci://cr.kgateway.dev/kgateway-dev/charts/...   │
+│                                                                  │
+│  GATEWAY API CRDs (v1.4.0):                                      │
+│    kubectl apply -f https://github.com/kubernetes-sigs/          │
+│      gateway-api/releases/download/v1.4.0/standard-install.yaml  │
+│                                                                  │
 │  DEBUGGING:                                                      │
-│    kubectl get pods -n kgateway-system                           │
-│    kubectl logs -n kgateway-system -l app.kubernetes.io/name=... │
-│    kubectl describe gateway -n kgateway-system                   │
+│    kubectl get pods -n agentgateway-system                       │
+│    kubectl get gateway -A                                        │
+│    kubectl get httproute -A                                      │
+│    kubectl logs -n agentgateway-system -l app.kubernetes.io/...  │
 │                                                                  │
 │  TESTING:                                                        │
-│    NODE_IP=$(kubectl get nodes -o jsonpath='{...}')              │
-│    NODE_PORT=$(kubectl get svc ... -o jsonpath='{...}')          │
-│    curl http://${NODE_IP}:${NODE_PORT}/healthz                   │
+│    kubectl get svc -n agentgateway-system                        │
+│    curl http://localhost:<nodeport>/healthz                      │
 │                                                                  │
 └─────────────────────────────────────────────────────────────────┘
 ```
+
+---
+
+## Version History
+
+| Date | Version | Changes |
+|------|---------|---------|
+| 2025-01-17 | 1.0 | Initial guide with verified installation commands |
+
+### Verified Against
+- Gateway API: v1.4.0
+- kgateway: v2.1.2 (stable), v2.2.0-main (dev)
+- agentgateway standalone: v2.2.0-main
+- Kind: v0.25.0
+- Claude Code: v2.1.x (native installation)
 
 ---
 
